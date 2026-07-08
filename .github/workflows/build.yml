@@ -1,0 +1,74 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # 官方 kivy/buildozer:latest 会不定期跟着 Ubuntu/Python 版本升级
+      # （最近升到了 ubuntu:26.04 / python 3.14），导致 hostpython3 和
+      # buildozer.spec 里的 requirements 版本对不上而构建失败。这里改成
+      # 自建镜像，固定 python:3.11-bookworm，版本完全自己控制，不再漂移。
+      - name: Build buildozer image (pinned Python 3.11)
+        run: docker build -t mycgc-buildozer -f docker/buildozer.Dockerfile .
+
+      # 缓存 Android SDK/NDK 和 p4a 构建产物，第一次构建会很慢（要下载
+      # SDK/NDK），之后靠缓存会快很多
+      - name: Restore buildozer cache
+        uses: actions/cache@v4
+        with:
+          path: .buildozer_cache
+          key: buildozer-global-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-global-
+
+      # 用 tee 把完整输出同时存到 build_full.log，方便失败时定位。
+      - name: Build APK with pinned Buildozer image
+        run: |
+          set -o pipefail
+          mkdir -p .buildozer_cache bin
+          chmod -R 777 .buildozer_cache
+          chmod -R 777 "${{ github.workspace }}"
+          docker run --rm \
+            -v "${{ github.workspace }}":/home/user/hostcwd \
+            -v "${{ github.workspace }}/.buildozer_cache":/home/user/.buildozer \
+            mycgc-buildozer \
+            android debug 2>&1 | tee build_full.log
+
+      # 只有在上一步失败时才运行：自动从完整日志里挑出真正报错的那一段，
+      # 直接打印在这一步的输出里，不用再手动翻。
+      - name: Extract real error (only runs on failure)
+        if: failure()
+        run: |
+          echo "################ 关键报错定位 ################"
+          grep -n -iE "error|exception|traceback|fatal|failed to" build_full.log | tail -n 60 || true
+          echo ""
+          echo "################ 报错前后200行上下文 ################"
+          LINE=$(grep -n -iE "error|exception|traceback|fatal" build_full.log | tail -n 1 | cut -d: -f1)
+          if [ -n "$LINE" ]; then
+            START=$((LINE > 200 ? LINE - 200 : 1))
+            END=$((LINE + 20))
+            sed -n "${START},${END}p" build_full.log
+          else
+            echo "没匹配到关键词，请下载 full-build-log 这个 artifact 自己看完整日志"
+          fi
+
+      # 无论成功失败都上传完整日志，保底能下载下来自己查
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-build-log
+          path: build_full.log
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: mycgc-apk
+          path: bin/*.apk
